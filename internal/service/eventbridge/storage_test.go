@@ -798,3 +798,46 @@ func TestPutEvents_SQSDeliveryEndpoint(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildEventPayload_Resources verifies that the delivered event always
+// carries resources, as AWS does: the entry's Resources, or [] without them.
+func TestBuildEventPayload_Resources(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		resources []string
+		want      string
+	}{
+		{
+			name: "no resources",
+			want: `[]`,
+		},
+		{
+			name:      "the entry's resources",
+			resources: []string{"arn:aws:s3:::bucket-a", "arn:aws:s3:::bucket-b"},
+			want:      `["arn:aws:s3:::bucket-a","arn:aws:s3:::bucket-b"]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := NewMemoryStorage()
+			body := s.buildEventPayload("event-1", defaultEventBusName, &Target{ID: testTargetID1}, &PutEventsRequestEntry{
+				Source: testEventSourceMyTest, DetailType: testDetailTypeTest, Detail: testDetailHelloWorld,
+				Resources: tt.resources,
+			})
+
+			var ev map[string]json.RawMessage
+			if err := json.Unmarshal(body, &ev); err != nil {
+				t.Fatalf("payload not valid JSON: %v", err)
+			}
+
+			if got := string(ev["resources"]); got != tt.want {
+				t.Errorf("resources = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}

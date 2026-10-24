@@ -710,6 +710,12 @@ func (s *MemoryStorage) trimDeliveredEventsLocked() {
 
 // buildEventPayload builds the CloudWatch Events envelope for delivery.
 func (s *MemoryStorage) buildEventPayload(eventID, eventBusName string, target *Target, entry *PutEventsRequestEntry) []byte {
+	// AWS always sends resources, as [] when the entry has none.
+	resources := entry.Resources
+	if resources == nil {
+		resources = []string{}
+	}
+
 	payload := map[string]any{
 		"version":     "0",
 		"id":          eventID,
@@ -719,6 +725,7 @@ func (s *MemoryStorage) buildEventPayload(eventID, eventBusName string, target *
 		"region":      s.region,
 		"account":     s.accountID,
 		"time":        time.Now().Format(time.RFC3339),
+		"resources":   resources,
 	}
 
 	if eventBusName != defaultEventBusName {
