@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/sivchari/kumo/internal/awsauth"
+	"github.com/sivchari/kumo/internal/service"
 	"github.com/sivchari/kumo/internal/storage"
 )
 
@@ -89,7 +90,9 @@ func WithDataDir(dir string) Option {
 	}
 }
 
-// WithBaseURL sets the base URL for internal service-to-service communication.
+// WithBaseURL sets the kumo base URL that SQS and Lambda targets are delivered
+// through when PutEvents does not come from an HTTP request. Requests served by
+// kumo deliver through the server that received them (see service.RequestBaseURL).
 func WithBaseURL(url string) Option {
 	return func(s *MemoryStorage) {
 		s.baseURL = url
@@ -613,9 +616,13 @@ func (s *MemoryStorage) ListTargetsByRule(_ context.Context, eventBusName, ruleN
 }
 
 // PutEvents puts events to the event bus, matches against rules, and records deliveries.
-func (s *MemoryStorage) PutEvents(_ context.Context, entries []PutEventsRequestEntry) ([]PutEventsResultEntry, error) {
+func (s *MemoryStorage) PutEvents(ctx context.Context, entries []PutEventsRequestEntry) ([]PutEventsResultEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// SQS and Lambda targets are delivered through the kumo server that
+	// received this request, wherever it listens.
+	baseURL := service.RequestBaseURL(ctx, s.baseURL)
 
 	results := make([]PutEventsResultEntry, len(entries))
 
@@ -628,7 +635,7 @@ func (s *MemoryStorage) PutEvents(_ context.Context, entries []PutEventsRequestE
 			eventBusName = defaultEventBusName
 		}
 
-		s.matchAndDeliver(eventID, eventBusName, &entry)
+		s.matchAndDeliver(eventID, eventBusName, &entry, baseURL)
 	}
 
 	s.saveLocked()
@@ -636,8 +643,9 @@ func (s *MemoryStorage) PutEvents(_ context.Context, entries []PutEventsRequestE
 	return results, nil
 }
 
-// matchAndDeliver matches an event against rules, records deliveries, and performs HTTP delivery for API destinations. Must be called under lock.
-func (s *MemoryStorage) matchAndDeliver(eventID, eventBusName string, entry *PutEventsRequestEntry) {
+// matchAndDeliver matches an event against rules, records deliveries, and performs HTTP delivery for API destinations.
+// SQS and Lambda targets are delivered through the kumo endpoint at baseURL. Must be called under lock.
+func (s *MemoryStorage) matchAndDeliver(eventID, eventBusName string, entry *PutEventsRequestEntry, baseURL string) {
 	rules, exists := s.Rules[eventBusName]
 	if !exists {
 		return
@@ -680,11 +688,11 @@ func (s *MemoryStorage) matchAndDeliver(eventID, eventBusName string, entry *Put
 			}
 
 			if isSQSArn(target.Arn) {
-				go s.deliverToSQS(target, payload)
+				go s.deliverToSQS(baseURL, target, payload)
 			}
 
 			if isLambdaArn(target.Arn) {
-				go s.deliverToLambda(target, payload)
+				go s.deliverToLambda(baseURL, target, payload)
 			}
 		}
 
@@ -886,8 +894,8 @@ func isSQSArn(arn string) bool {
 	return strings.Contains(arn, ":sqs:")
 }
 
-// deliverToSQS sends an event to an SQS queue via the local kumo SQS endpoint.
-func (s *MemoryStorage) deliverToSQS(target *Target, payload []byte) {
+// deliverToSQS sends an event to an SQS queue via the kumo SQS endpoint at baseURL.
+func (s *MemoryStorage) deliverToSQS(baseURL string, target *Target, payload []byte) {
 	if payload == nil {
 		return
 	}
@@ -901,7 +909,7 @@ func (s *MemoryStorage) deliverToSQS(target *Target, payload []byte) {
 	}
 
 	queueName := parts[len(parts)-1]
-	sqsEndpoint := fmt.Sprintf("%s/000000000000/%s", s.baseURL, queueName)
+	sqsEndpoint := fmt.Sprintf("%s/000000000000/%s", baseURL, queueName)
 
 	reqBody := map[string]any{
 		"QueueUrl":    sqsEndpoint,
@@ -915,7 +923,7 @@ func (s *MemoryStorage) deliverToSQS(target *Target, payload []byte) {
 		return
 	}
 
-	req, err := http.NewRequestWithContext(s.deliveryCtx, http.MethodPost, s.baseURL+"/", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(s.deliveryCtx, http.MethodPost, baseURL+"/", bytes.NewReader(body))
 	if err != nil {
 		s.logger.Error("failed to create SQS request", "error", err, "queue", queueName)
 
@@ -945,8 +953,8 @@ func isLambdaArn(arn string) bool {
 	return strings.Contains(arn, ":lambda:")
 }
 
-// deliverToLambda invokes a Lambda function asynchronously via the local kumo Lambda endpoint.
-func (s *MemoryStorage) deliverToLambda(target *Target, payload []byte) {
+// deliverToLambda invokes a Lambda function asynchronously via the kumo Lambda endpoint at baseURL.
+func (s *MemoryStorage) deliverToLambda(baseURL string, target *Target, payload []byte) {
 	if payload == nil {
 		return
 	}
@@ -960,7 +968,7 @@ func (s *MemoryStorage) deliverToLambda(target *Target, payload []byte) {
 	}
 
 	functionName := parts[6]
-	endpoint := fmt.Sprintf("%s/2015-03-31/functions/%s/invocations", s.baseURL, functionName)
+	endpoint := fmt.Sprintf("%s/2015-03-31/functions/%s/invocations", baseURL, functionName)
 
 	req, err := http.NewRequestWithContext(s.deliveryCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {

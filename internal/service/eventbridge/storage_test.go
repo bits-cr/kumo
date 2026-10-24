@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -25,6 +26,9 @@ const (
 	testFieldMarker       = "marker"
 	testFieldVal          = "val"
 	testTargetID1         = "target-1"
+	testPatternMyTest     = `{"source":["my.test"]}`
+	testDetailTypeTest    = "TestEvent"
+	testDetailHelloWorld  = `{"hello":"world"}`
 )
 
 //nolint:funlen // Table-driven test with comprehensive InputPath coverage.
@@ -475,7 +479,7 @@ func TestPutEvents_APIDestinationCrossRegion(t *testing.T) {
 
 	if _, err := s.PutRule(ctx, &PutRuleRequest{
 		Name:         "test-rule",
-		EventPattern: `{"source":["my.test"]}`,
+		EventPattern: testPatternMyTest,
 		State:        string(RuleStateEnabled),
 	}); err != nil {
 		t.Fatalf("PutRule: %v", err)
@@ -488,7 +492,7 @@ func TestPutEvents_APIDestinationCrossRegion(t *testing.T) {
 	}
 
 	if _, err := s.PutEvents(ctx, []PutEventsRequestEntry{
-		{Source: testEventSourceMyTest, DetailType: "TestEvent", Detail: `{"hello":"world"}`},
+		{Source: testEventSourceMyTest, DetailType: testDetailTypeTest, Detail: testDetailHelloWorld},
 	}); err != nil {
 		t.Fatalf("PutEvents: %v", err)
 	}
@@ -559,7 +563,7 @@ func TestPutEvents_APIDestinationPathParameters(t *testing.T) {
 
 	if _, err := s.PutRule(ctx, &PutRuleRequest{
 		Name:         "test-rule",
-		EventPattern: `{"source":["my.test"]}`,
+		EventPattern: testPatternMyTest,
 		State:        string(RuleStateEnabled),
 	}); err != nil {
 		t.Fatalf("PutRule: %v", err)
@@ -581,7 +585,7 @@ func TestPutEvents_APIDestinationPathParameters(t *testing.T) {
 	}
 
 	if _, err := s.PutEvents(ctx, []PutEventsRequestEntry{
-		{Source: testEventSourceMyTest, DetailType: "TestEvent", Detail: `{"hello":"world"}`},
+		{Source: testEventSourceMyTest, DetailType: testDetailTypeTest, Detail: testDetailHelloWorld},
 	}); err != nil {
 		t.Fatalf("PutEvents: %v", err)
 	}
@@ -691,5 +695,106 @@ func TestDeliveredEventsNotPersisted(t *testing.T) {
 
 	if strings.Contains(string(data), `"deliveredEvents"`) {
 		t.Fatalf("snapshot must not contain deliveredEvents key, got: %s", string(data))
+	}
+}
+
+// sqsSendMessage is the part of an AmazonSQS.SendMessage request a test checks.
+type sqsSendMessage struct {
+	QueueURL    string `json:"QueueUrl"`    //nolint:tagliatelle // AWS SQS API field name.
+	MessageBody string `json:"MessageBody"` //nolint:tagliatelle // AWS SQS API field name.
+}
+
+// TestPutEvents_SQSDeliveryEndpoint verifies that SQS targets are delivered
+// through the kumo server that received PutEvents, wherever it listens, and
+// through WithBaseURL's endpoint when PutEvents does not come from a request.
+// The fixed endpoint used to be the only one, so a server on another port,
+// such as kumo.NewServer's random one, never delivered.
+//
+//nolint:funlen // End-to-end test with setup, dispatch, and assertion.
+func TestPutEvents_SQSDeliveryEndpoint(t *testing.T) {
+	t.Parallel()
+
+	received := make(chan sqsSendMessage, 1)
+
+	sqs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if target := r.Header.Get("X-Amz-Target"); target != "AmazonSQS.SendMessage" {
+			t.Errorf("X-Amz-Target = %q, want AmazonSQS.SendMessage", target)
+		}
+
+		var msg sqsSendMessage
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			t.Errorf("decode SendMessage: %v", err)
+		}
+
+		received <- msg
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer sqs.Close()
+
+	addr, ok := sqs.Listener.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener address %v is not TCP", sqs.Listener.Addr())
+	}
+
+	tests := []struct {
+		name    string
+		baseURL string
+		ctx     context.Context //nolint:containedctx // table input
+	}{
+		{
+			name:    "the server that received the request",
+			baseURL: "http://127.0.0.1:1", // nothing listens here
+			ctx:     context.WithValue(context.Background(), http.LocalAddrContextKey, addr),
+		},
+		{
+			name:    "WithBaseURL outside a request",
+			baseURL: sqs.URL,
+			ctx:     context.Background(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewMemoryStorage(WithBaseURL(tt.baseURL))
+
+			if _, err := s.PutRule(tt.ctx, &PutRuleRequest{
+				Name:         "sqs-rule",
+				EventPattern: testPatternMyTest,
+				State:        string(RuleStateEnabled),
+			}); err != nil {
+				t.Fatalf("PutRule: %v", err)
+			}
+
+			if _, err := s.PutTargets(tt.ctx, "", "sqs-rule", []TargetInput{
+				{ID: testTargetID1, Arn: "arn:aws:sqs:us-east-1:000000000000:delivery-queue"},
+			}); err != nil {
+				t.Fatalf("PutTargets: %v", err)
+			}
+
+			if _, err := s.PutEvents(tt.ctx, []PutEventsRequestEntry{
+				{Source: testEventSourceMyTest, DetailType: testDetailTypeTest, Detail: testDetailHelloWorld},
+			}); err != nil {
+				t.Fatalf("PutEvents: %v", err)
+			}
+
+			select {
+			case msg := <-received:
+				if want := sqs.URL + "/000000000000/delivery-queue"; msg.QueueURL != want {
+					t.Errorf("QueueUrl = %q, want %q", msg.QueueURL, want)
+				}
+
+				var ev map[string]any
+				if err := json.Unmarshal([]byte(msg.MessageBody), &ev); err != nil {
+					t.Fatalf("MessageBody not valid JSON: %v", err)
+				}
+
+				if ev["source"] != testEventSourceMyTest {
+					t.Errorf("source = %v, want %s", ev["source"], testEventSourceMyTest)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the SQS target did not receive the event")
+			}
+		})
 	}
 }
